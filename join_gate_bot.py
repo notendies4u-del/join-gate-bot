@@ -1025,6 +1025,67 @@ async def send_start_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def get_verification_candidates(context, user):
+    """Return active servers where the user is not yet verified internally."""
+    db = load_db()
+    user_key = str(user.id)
+    server_ids = set(load_rules().keys())
+
+    stored_user = db.get("users", {}).get(user_key, {})
+    server_ids.update(stored_user.get("servers", {}).keys())
+
+    for server_id, audit in db.get("member_audit", {}).items():
+        if user_key in audit.get("members", {}):
+            server_ids.add(server_id)
+
+    candidates = []
+    for server_id in server_ids:
+        try:
+            chat_id = int(server_id)
+        except (TypeError, ValueError):
+            continue
+
+        if is_verified(user.id, chat_id):
+            continue
+
+        try:
+            member = await context.bot.get_chat_member(chat_id, user.id)
+            status = str(member.status).lower()
+            if status not in ["member", "administrator", "creator", "restricted"]:
+                continue
+
+            chat = await context.bot.get_chat(chat_id)
+            candidates.append({
+                "chat_id": chat_id,
+                "chat_title": chat.title or str(chat_id),
+                "status": status,
+            })
+        except Exception:
+            continue
+
+    return sorted(candidates, key=lambda item: item["chat_title"].lower())
+
+
+async def show_verification_prompt(query, user, chat_id, chat_title):
+    rules = get_rules(chat_id)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ I agree to the rules",
+                callback_data=f"agree:{chat_id}:{user.id}",
+            )
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="menu_back")],
+    ])
+
+    await query.edit_message_text(
+        f"✅ Verify Access for {chat_title}\n\n"
+        "Please read and acknowledge the rules below.\n\n"
+        f"{rules}",
+        reply_markup=keyboard,
+    )
+
+
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1092,6 +1153,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not pending:
             db = load_db()
+            candidates = await get_verification_candidates(context, user)
             verified_servers = [
                 info
                 for members in db.get("verified", {}).values()
@@ -1099,7 +1161,37 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if str(uid) == str(user.id)
             ]
 
-            if verified_servers:
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                add_pending_verify(
+                    candidate["chat_id"],
+                    candidate["chat_title"],
+                    user,
+                )
+                await show_verification_prompt(
+                    query,
+                    user,
+                    candidate["chat_id"],
+                    candidate["chat_title"],
+                )
+            elif len(candidates) > 1:
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            f"✅ {candidate['chat_title']}",
+                            callback_data=f"menu_verify_server:{candidate['chat_id']}",
+                        )
+                    ]
+                    for candidate in candidates
+                ]
+                keyboard.append([
+                    InlineKeyboardButton("⬅️ Back", callback_data="menu_back")
+                ])
+                await query.edit_message_text(
+                    "Choose the server you want to verify for:",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            elif verified_servers:
                 server_names = sorted({
                     info.get("chat_title") or str(info.get("chat_id", "the server"))
                     for info in verified_servers
@@ -1118,24 +1210,35 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat_id = int(pending["chat_id"])
         chat_title = pending.get("chat_title", "the server")
-        rules = get_rules(chat_id)
+        await show_verification_prompt(query, user, chat_id, chat_title)
+        return
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ I agree to the rules",
-                    callback_data=f"agree:{chat_id}:{user.id}"
+    if data.startswith("menu_verify_server:"):
+        try:
+            chat_id = int(data.split(":", 1)[1])
+            member = await context.bot.get_chat_member(chat_id, user.id)
+            status = str(member.status).lower()
+            if status not in ["member", "administrator", "creator", "restricted"]:
+                await query.edit_message_text(
+                    "I could not confirm that you are currently in that server."
                 )
-            ],
-            [InlineKeyboardButton("⬅️ Back", callback_data="menu_back")]
-        ])
+                return
 
-        await query.edit_message_text(
-            f"✅ Verify Access for {chat_title}\n\n"
-            f"Please read and acknowledge the rules below.\n\n"
-            f"{rules}",
-            reply_markup=keyboard,
-        )
+            if is_verified(user.id, chat_id):
+                await query.edit_message_text(
+                    "✅ You have already verified for this server.\n\n"
+                    "Your access is already unlocked."
+                )
+                return
+
+            chat = await context.bot.get_chat(chat_id)
+            chat_title = chat.title or str(chat_id)
+            add_pending_verify(chat_id, chat_title, user)
+            await show_verification_prompt(query, user, chat_id, chat_title)
+        except Exception:
+            await query.edit_message_text(
+                "I could not prepare verification for that server. Please try again."
+            )
         return
 
 
