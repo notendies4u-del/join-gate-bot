@@ -228,6 +228,58 @@ def clear_pending_verify(user_id):
     save_db(db)
 
 
+def complete_verification(user, chat_id, chat_title="unknown", source="verified"):
+    """Move one user from pending/unverified to verified in one database write."""
+    db = load_db()
+    chat_key = str(chat_id)
+    user_id = user.id if hasattr(user, "id") else int(user)
+    user_key = str(user_id)
+    existing_user = db.get("users", {}).get(user_key, {})
+    now = int(time.time())
+
+    db.setdefault("verified", {})
+    db["verified"].setdefault(chat_key, {})
+    db["verified"][chat_key][user_key] = {
+        "user_id": user_id,
+        "username": getattr(user, "username", None) or existing_user.get("username"),
+        "name": getattr(user, "full_name", None) or existing_user.get("name") or f"User {user_id}",
+        "chat_id": int(chat_id),
+        "chat_title": chat_title or "unknown",
+        "verified_at": now,
+        "source": source,
+    }
+
+    pending = db.setdefault("pending_verify", {})
+    pending_info = pending.get(user_key)
+    if not pending_info or str(pending_info.get("chat_id")) == chat_key:
+        pending.pop(user_key, None)
+
+    db.setdefault("member_audit", {})
+    audit = db["member_audit"].setdefault(chat_key, {
+        "chat_id": int(chat_id),
+        "title": chat_title or chat_key,
+        "scanned_at": now,
+        "members": {},
+    })
+    members = audit.setdefault("members", {})
+    existing_member = members.get(user_key, {})
+    members[user_key] = {
+        **existing_member,
+        "user_id": user_id,
+        "username": getattr(user, "username", None) or existing_user.get("username"),
+        "name": getattr(user, "full_name", None) or existing_user.get("name") or f"User {user_id}",
+        "is_bot": bool(getattr(user, "is_bot", existing_user.get("is_bot", False))),
+        "is_deleted": False,
+        "is_admin": bool(existing_member.get("is_admin", False)),
+        "verify_status": "verified",
+        "in_verified_db": True,
+        "in_pending_db": False,
+        "updated_at": now,
+    }
+
+    save_db(db)
+
+
 def mark_verified(user, chat_id, chat_title="unknown", source="verified"):
     db = load_db()
     db.setdefault("verified", {})
@@ -780,10 +832,13 @@ async def agree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ Failed to unlock you: {e}")
         return
 
-    await set_member_tag(chat_id, target_user_id, None)
-    mark_verified(query.from_user, chat_id, chat_title, source="rules_agree")
-    audit_mark_verified(chat_id, chat_title, query.from_user)
-    clear_pending_verify(target_user_id)
+    await set_member_tag(chat_id, target_user_id, "VERIFIED")
+    complete_verification(
+        query.from_user,
+        chat_id,
+        chat_title,
+        source="rules_agree",
+    )
 
     try:
         await query.message.delete()
@@ -897,15 +952,13 @@ async def self_heal_verify(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                     permissions=UNLOCKED_PERMS,
                 )
 
-                try:
-                    await set_member_tag(chat_id, user.id, None)
-                except Exception:
-                    pass
-
-                try:
-                    clear_pending_verify(user.id)
-                except Exception:
-                    pass
+                await set_member_tag(chat_id, user.id, "VERIFIED")
+                complete_verification(
+                    user,
+                    chat_id,
+                    chat_title,
+                    source="self_heal_verified",
+                )
 
                 remember_user(
                     user,
@@ -2710,9 +2763,13 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=user_id,
             permissions=UNLOCKED_PERMS,
         )
-        await set_member_tag(chat_id, user_id, None)
-        clear_pending_verify(user_id)
-        mark_verified(user_id, chat_id, chat_title, source="manual_approve")
+        await set_member_tag(chat_id, user_id, "VERIFIED")
+        complete_verification(
+            user_id,
+            chat_id,
+            chat_title,
+            source="manual_approve",
+        )
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
