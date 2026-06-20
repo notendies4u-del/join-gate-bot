@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+
+invite_db.json
+invite_db.backup*.json
+
+.codex/
+
+join_gate_bot.py.*.backup*
+join_gate_bot.py.*
