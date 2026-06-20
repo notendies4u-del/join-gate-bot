@@ -832,7 +832,7 @@ async def agree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ Failed to unlock you: {e}")
         return
 
-    await set_member_tag(chat_id, target_user_id, "VERIFIED")
+    await set_member_tag(chat_id, target_user_id, None)
     complete_verification(
         query.from_user,
         chat_id,
@@ -952,7 +952,7 @@ async def self_heal_verify(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                     permissions=UNLOCKED_PERMS,
                 )
 
-                await set_member_tag(chat_id, user.id, "VERIFIED")
+                await set_member_tag(chat_id, user.id, None)
                 complete_verification(
                     user,
                     chat_id,
@@ -2763,7 +2763,7 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_id=user_id,
             permissions=UNLOCKED_PERMS,
         )
-        await set_member_tag(chat_id, user_id, "VERIFIED")
+        await set_member_tag(chat_id, user_id, None)
         complete_verification(
             user_id,
             chat_id,
