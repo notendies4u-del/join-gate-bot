@@ -794,11 +794,11 @@ async def agree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         return
 
-    await query.answer()
     remember_user(query.from_user, "agree")
 
     parts = query.data.split(":")
     if len(parts) != 3:
+        await query.answer("This verification button is invalid.", show_alert=True)
         return
 
     _, chat_id, target_user_id = parts
@@ -808,6 +808,8 @@ async def agree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != target_user_id:
         await query.answer("This button is not for you.", show_alert=True)
         return
+
+    already_verified = is_verified(target_user_id, chat_id)
 
     try:
         chat_obj = await context.bot.get_chat(chat_id)
@@ -829,6 +831,7 @@ async def agree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             permissions=UNLOCKED_PERMS,
         )
     except Exception as e:
+        await query.answer("Verification failed. Please try again.", show_alert=True)
         await query.edit_message_text(f"❌ Failed to unlock you: {e}")
         return
 
@@ -841,10 +844,29 @@ async def agree_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        await query.message.delete()
+        if already_verified:
+            await query.answer(
+                "You have already verified. Your access is confirmed.",
+                show_alert=True,
+            )
+            await query.edit_message_text(
+                f"✅ Already verified for {chat_title}.\n\n"
+                "Your access is confirmed and you can return to the server."
+            )
+        else:
+            await query.answer(
+                "Verification complete! You are now verified.",
+                show_alert=True,
+            )
+            await query.edit_message_text(
+                f"✅ You are verified for {chat_title}.\n\n"
+                "Your access is unlocked and you can return to the server."
+            )
     except Exception:
         try:
-            await query.edit_message_text("✅ You agreed to the rules and have been unlocked.")
+            await query.edit_message_text(
+                "✅ Verification complete. Your server access is unlocked."
+            )
         except Exception:
             pass
 
@@ -1069,10 +1091,29 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = get_pending_verify(user.id)
 
         if not pending:
-            await query.edit_message_text(
-                "I do not see a pending verification request for you right now.\n\n"
-                "If you can already send messages in the server, you are already verified. If you cannot talk in the server, contact an admin or try Verify Access again."
-            )
+            db = load_db()
+            verified_servers = [
+                info
+                for members in db.get("verified", {}).values()
+                for uid, info in members.items()
+                if str(uid) == str(user.id)
+            ]
+
+            if verified_servers:
+                server_names = sorted({
+                    info.get("chat_title") or str(info.get("chat_id", "the server"))
+                    for info in verified_servers
+                })
+                await query.edit_message_text(
+                    "✅ You have already verified.\n\n"
+                    f"Verified server(s): {', '.join(server_names)}\n\n"
+                    "Your access is already unlocked."
+                )
+            else:
+                await query.edit_message_text(
+                    "I do not see a pending verification request for you right now.\n\n"
+                    "If you cannot talk in the server, contact an admin so they can restore your verification request."
+                )
             return
 
         chat_id = int(pending["chat_id"])
