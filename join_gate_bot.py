@@ -2274,161 +2274,199 @@ async def refreshstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await user_is_admin(update, context):
         return
 
+    chat_key = str(update.effective_chat.id)
+    running_scans = context.application.bot_data.setdefault(
+        "running_stats_scans",
+        set(),
+    )
+
+    if chat_key in running_scans:
+        await update.message.reply_text(
+            "A stats refresh is already running for this server."
+        )
+        return
+
+    running_scans.add(chat_key)
+    context.application.create_task(
+        refreshstats_worker(update, context, chat_key),
+        update=update,
+        name=f"refreshstats:{chat_key}",
+    )
+
+
+async def refreshstats_worker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_key: str,
+):
     chat = update.effective_chat
     progress = await update.message.reply_text(
         "🔄 Refreshing server stats from Telegram..."
     )
 
-    db = load_db()
-    chat_key = str(chat.id)
-    users = db.get("users", {})
-    verified = db.get("verified", {}).get(chat_key, {})
-    pending_all = db.get("pending_verify", {})
-    verified_ids = set(verified)
-    pending_ids = {
-        str(uid)
-        for uid, info in pending_all.items()
-        if str(info.get("chat_id")) == chat_key
-    }
-    old_audit = db.get("member_audit", {}).get(chat_key, {})
-    old_members = old_audit.get("members", {})
-
     try:
-        telegram_member_count = await context.bot.get_chat_member_count(chat.id)
-    except Exception:
-        telegram_member_count = old_audit.get("telegram_member_count")
-
-    known_ids = {
-        str(uid)
-        for uid, info in users.items()
-        if chat_key in info.get("servers", {})
-    }
-    known_ids.update(str(uid) for uid in verified)
-    known_ids.update(
-        str(uid)
-        for uid, info in pending_all.items()
-        if str(info.get("chat_id")) == chat_key
-    )
-    known_ids.update(str(uid) for uid in old_members)
-
-    try:
-        administrators = await context.bot.get_chat_administrators(chat.id)
-        known_ids.update(str(member.user.id) for member in administrators)
-    except Exception:
-        administrators = []
-
-    new_members = {}
-    departed_ids = set()
-    error_ids = set()
-    checked = 0
-    total = len(known_ids)
-
-    ordered_ids = sorted(
-        known_ids,
-        key=lambda value: (
-            0,
-            int(value),
-        ) if str(value).lstrip("-").isdigit() else (1, str(value)),
-    )
-
-    for processed, uid in enumerate(ordered_ids, start=1):
-        member = None
-
-        if not str(uid).lstrip("-").isdigit():
-            error_ids.add(uid)
-            continue
+        db = load_db()
+        users = db.get("users", {})
+        verified = db.get("verified", {}).get(chat_key, {})
+        pending_all = db.get("pending_verify", {})
+        verified_ids = set(verified)
+        pending_ids = {
+            str(uid)
+            for uid, info in pending_all.items()
+            if str(info.get("chat_id")) == chat_key
+        }
+        old_audit = db.get("member_audit", {}).get(chat_key, {})
+        old_members = old_audit.get("members", {})
 
         try:
-            member = await context.bot.get_chat_member(chat.id, int(uid))
-            checked += 1
-        except Exception as exc:
-            retry_after = getattr(exc, "retry_after", None)
-            if retry_after:
-                await asyncio.sleep(float(retry_after) + 1)
-                try:
-                    member = await context.bot.get_chat_member(chat.id, int(uid))
-                    checked += 1
-                except Exception:
-                    member = None
+            telegram_member_count = await context.bot.get_chat_member_count(chat.id)
+        except Exception:
+            telegram_member_count = old_audit.get("telegram_member_count")
 
-        if member is None:
-            error_ids.add(uid)
-            if uid in old_members:
-                new_members[uid] = {
-                    **old_members[uid],
-                    "scan_error": True,
-                    "updated_at": int(time.time()),
-                }
-        else:
-            status = str(member.status).lower()
-            if status in ["left", "kicked", "banned"]:
-                departed_ids.add(uid)
-            elif status in ["member", "administrator", "creator", "restricted"]:
-                new_members[uid] = build_audit_member(
-                    member,
-                    verified_ids,
-                    pending_ids,
-                )
-            else:
+        known_ids = {
+            str(uid)
+            for uid, info in users.items()
+            if chat_key in info.get("servers", {})
+        }
+        known_ids.update(str(uid) for uid in verified)
+        known_ids.update(pending_ids)
+        known_ids.update(str(uid) for uid in old_members)
+
+        try:
+            administrators = await context.bot.get_chat_administrators(chat.id)
+            known_ids.update(str(member.user.id) for member in administrators)
+        except Exception:
+            pass
+
+        new_members = {}
+        departed_ids = set()
+        error_ids = set()
+        checked = 0
+        total = len(known_ids)
+
+        ordered_ids = sorted(
+            known_ids,
+            key=lambda value: (
+                0,
+                int(value),
+            ) if str(value).lstrip("-").isdigit() else (1, str(value)),
+        )
+
+        for processed, uid in enumerate(ordered_ids, start=1):
+            member = None
+
+            if not str(uid).lstrip("-").isdigit():
                 error_ids.add(uid)
+                continue
 
-        if processed % 50 == 0:
             try:
-                await progress.edit_text(
-                    f"🔄 Refreshing server stats... {processed}/{total} processed"
-                )
-            except Exception:
-                pass
+                member = await context.bot.get_chat_member(chat.id, int(uid))
+                checked += 1
+            except Exception as exc:
+                retry_after = getattr(exc, "retry_after", None)
+                if retry_after:
+                    await asyncio.sleep(float(retry_after) + 1)
+                    try:
+                        member = await context.bot.get_chat_member(chat.id, int(uid))
+                        checked += 1
+                    except Exception:
+                        member = None
 
-        await asyncio.sleep(0.04)
+            if member is None:
+                error_ids.add(uid)
+                if uid in old_members:
+                    new_members[uid] = {
+                        **old_members[uid],
+                        "scan_error": True,
+                        "updated_at": int(time.time()),
+                    }
+            else:
+                status = str(member.status).lower()
+                if status in ["left", "kicked", "banned"]:
+                    departed_ids.add(uid)
+                elif status in ["member", "administrator", "creator", "restricted"]:
+                    new_members[uid] = build_audit_member(
+                        member,
+                        verified_ids,
+                        pending_ids,
+                    )
+                else:
+                    error_ids.add(uid)
 
-    # A verified user should never remain in the pending reminder queue.
-    # Also remove users Telegram confirms have left or been banned.
-    pending_removed = 0
-    for uid in list(pending_all):
-        info = pending_all.get(uid, {})
-        if str(info.get("chat_id")) != chat_key:
-            continue
-        if uid in verified or uid in departed_ids:
-            pending_all.pop(uid, None)
-            pending_removed += 1
+            if processed % 50 == 0:
+                try:
+                    await progress.edit_text(
+                        f"🔄 Refreshing server stats... {processed}/{total} processed"
+                    )
+                except Exception:
+                    pass
 
-    now = int(time.time())
-    db.setdefault("member_audit", {})
-    db["member_audit"][chat_key] = {
-        "chat_id": chat.id,
-        "title": chat.title or chat_key,
-        "scanned_at": now,
-        "checked_count": checked,
-        "known_count": total,
-        "telegram_member_count": telegram_member_count,
-        "departed_count": len(departed_ids),
-        "error_count": len(error_ids),
-        "members": new_members,
-    }
-    db["pending_verify"] = pending_all
-    save_db(db)
+            await asyncio.sleep(0.04)
 
-    stats = get_audit_stats(db, chat.id)
-    total_line = (
-        f"👥 Telegram member total: {stats['telegram_total']}\n"
-        if stats["telegram_total"] is not None
-        else ""
-    )
-    await progress.edit_text(
-        f"✅ Stats refreshed for {chat.title}\n\n"
-        f"{total_line}"
-        f"🗂 Active tracked members: {stats['active']}\n"
-        f"✅ Verified: {stats['verified']}\n"
-        f"⏳ Pending: {stats['pending']}\n"
-        f"❔ Unknown: {stats['unknown']}\n"
-        f"🛡 Admins: {stats['admins']}\n"
-        f"🤖 Bots: {stats['bots']}\n"
-        f"🚪 Left or banned: {stats['departed']}\n"
-        f"⚠️ Lookup errors: {stats['errors']}\n"
-        f"🧹 Stale pending records removed: {pending_removed}\n\n"
-        "Use /stats to view this snapshot."
-    )
+        # Reload before saving so messages handled during the background scan
+        # are not overwritten by the snapshot captured at scan start.
+        latest_db = load_db()
+        latest_pending = latest_db.get("pending_verify", {})
+        latest_verified = latest_db.get("verified", {}).get(chat_key, {})
+        pending_removed = 0
+
+        for uid in list(latest_pending):
+            info = latest_pending.get(uid, {})
+            if str(info.get("chat_id")) != chat_key:
+                continue
+            if uid in latest_verified or uid in departed_ids:
+                latest_pending.pop(uid, None)
+                pending_removed += 1
+
+        now = int(time.time())
+        latest_db.setdefault("member_audit", {})
+        latest_db["member_audit"][chat_key] = {
+            "chat_id": chat.id,
+            "title": chat.title or chat_key,
+            "scanned_at": now,
+            "checked_count": checked,
+            "known_count": total,
+            "telegram_member_count": telegram_member_count,
+            "departed_count": len(departed_ids),
+            "error_count": len(error_ids),
+            "members": new_members,
+        }
+        latest_db["pending_verify"] = latest_pending
+        save_db(latest_db)
+
+        stats = get_audit_stats(latest_db, chat.id)
+        total_line = (
+            f"👥 Telegram member total: {stats['telegram_total']}\n"
+            if stats["telegram_total"] is not None
+            else ""
+        )
+        await progress.edit_text(
+            f"✅ Stats refreshed for {chat.title}\n\n"
+            f"{total_line}"
+            f"🗂 Active tracked members: {stats['active']}\n"
+            f"✅ Verified: {stats['verified']}\n"
+            f"⏳ Pending: {stats['pending']}\n"
+            f"❔ Unknown: {stats['unknown']}\n"
+            f"🛡 Admins: {stats['admins']}\n"
+            f"🤖 Bots: {stats['bots']}\n"
+            f"🚪 Left or banned: {stats['departed']}\n"
+            f"⚠️ Lookup errors: {stats['errors']}\n"
+            f"🧹 Stale pending records removed: {pending_removed}\n\n"
+            "Use /stats to view this snapshot."
+        )
+    except Exception as exc:
+        print(f"[REFRESH STATS ERROR] chat={chat_key} error={exc}", flush=True)
+        try:
+            await progress.edit_text(
+                "❌ Stats refresh failed. Check the service logs for details."
+            )
+        except Exception:
+            pass
+    finally:
+        context.application.bot_data.get(
+            "running_stats_scans",
+            set(),
+        ).discard(chat_key)
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
