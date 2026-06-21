@@ -2493,6 +2493,12 @@ async def refreshstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = update.effective_chat
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
     db = load_db()
     stats = await get_readonly_stats(context.bot, db, chat.id)
     links_here = sum(
@@ -2507,15 +2513,25 @@ async def refreshstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if int(info.get("chat_id", 0)) == chat.id
     )
 
-    await update.message.reply_text(
-        format_readonly_stats(
-            chat.title,
-            stats,
-            links_here,
-            bans_here,
-            reviews_here,
-        )
+    text = format_readonly_stats(
+        chat.title,
+        stats,
+        links_here,
+        bans_here,
+        reviews_here,
     )
+
+    try:
+        await update.effective_user.send_message(text)
+    except Exception:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text=(
+                f"{update.effective_user.mention_html()} start a DM with me first, "
+                "then run /refreshstats again."
+            ),
+            parse_mode="HTML",
+        )
 
 
 async def refreshstats_worker(
