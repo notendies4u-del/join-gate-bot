@@ -1881,7 +1881,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
 
     if data == "admin_stats":
-        stats = get_audit_stats(db, chat.id)
+        stats = await get_readonly_stats(context.bot, db, chat.id)
 
         bans_here = db.get("bans", {}).get(str(chat.id), {})
 
@@ -1895,29 +1895,13 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if int(info.get("chat_id", 0)) == chat.id
         ]
 
-        if not stats["scanned_at"]:
-            text = (
-                f"📊 Stats for {chat.title}\n\n"
-                "No current member snapshot exists yet.\n\n"
-                "Run /refreshstats in the server to build it."
-            )
-        else:
-            text = (
-                f"📊 Stats for {chat.title}\n\n"
-                f"👥 Telegram member total: {stats['telegram_total'] if stats['telegram_total'] is not None else 'unavailable'}\n"
-                f"🗂 Active tracked members: {stats['active']}\n"
-                f"✅ Verified through bot: {stats['verified']}\n"
-                f"⏳ Pending verification: {stats['pending']}\n"
-                f"❔ Unknown / not recorded: {stats['unknown']}\n"
-                f"🛡 Admins: {stats['admins']}\n"
-                f"🤖 Bots: {stats['bots']}\n"
-                f"🚪 Left or banned in last scan: {stats['departed']}\n"
-                f"⚠️ Lookup errors: {stats['errors']}\n\n"
-                f"🔗 Personal invite links: {len(links_here)}\n"
-                f"🔨 Persistent bans: {len(bans_here)}\n"
-                f"🚨 Link reviews awaiting admin: {len(reviews_here)}\n\n"
-                f"Last refreshed: {format_scan_time(stats['scanned_at'])}"
-            )
+        text = format_readonly_stats(
+            chat.title,
+            stats,
+            len(links_here),
+            len(bans_here),
+            len(reviews_here),
+        )
 
         await query.edit_message_text(text, reply_markup=back)
         return
@@ -2400,34 +2384,71 @@ def format_scan_time(timestamp):
         return str(timestamp)
 
 
-def get_audit_stats(db, chat_id):
-    audit = db.get("member_audit", {}).get(str(chat_id), {})
-    members = audit.get("members", {})
+async def get_readonly_stats(bot, db, chat_id):
+    """Calculate stats without modifying invite_db.json or its audit section."""
+    chat_key = str(chat_id)
+    verified_ids = set(db.get("verified", {}).get(chat_key, {}))
+    pending_ids = {
+        str(uid)
+        for uid, info in db.get("pending_verify", {}).items()
+        if str(info.get("chat_id")) == chat_key
+    }
+
+    try:
+        telegram_total = await bot.get_chat_member_count(chat_id)
+    except Exception:
+        telegram_total = None
+
+    try:
+        administrators = await bot.get_chat_administrators(chat_id)
+        admin_count = len(administrators)
+    except Exception:
+        admin_count = None
+
+    overlap = verified_ids & pending_ids
+    classified_ids = verified_ids | pending_ids
+    unknown_estimate = None
+    if telegram_total is not None:
+        unknown_estimate = max(telegram_total - len(classified_ids), 0)
 
     return {
-        "audit": audit,
-        "members": members,
-        "active": len(members),
-        "verified": sum(
-            1 for info in members.values()
-            if info.get("verify_status") == "verified"
-        ),
-        "pending": sum(
-            1 for info in members.values()
-            if info.get("verify_status") == "pending"
-        ),
-        "unknown": sum(
-            1 for info in members.values()
-            if info.get("verify_status") == "unknown"
-        ),
-        "admins": sum(1 for info in members.values() if info.get("is_admin")),
-        "bots": sum(1 for info in members.values() if info.get("is_bot")),
-        "departed": int(audit.get("departed_count", 0)),
-        "errors": int(audit.get("error_count", 0)),
-        "checked": int(audit.get("checked_count", 0)),
-        "telegram_total": audit.get("telegram_member_count"),
-        "scanned_at": int(audit.get("scanned_at", 0)),
+        "telegram_total": telegram_total,
+        "verified": len(verified_ids),
+        "pending": len(pending_ids),
+        "overlap": len(overlap),
+        "classified": len(classified_ids),
+        "unknown_estimate": unknown_estimate,
+        "admins": admin_count,
     }
+
+
+def format_readonly_stats(chat_title, stats, links, bans, reviews):
+    total = (
+        stats["telegram_total"]
+        if stats["telegram_total"] is not None
+        else "unavailable"
+    )
+    admins = stats["admins"] if stats["admins"] is not None else "unavailable"
+    unknown = (
+        stats["unknown_estimate"]
+        if stats["unknown_estimate"] is not None
+        else "unavailable"
+    )
+
+    return (
+        f"📊 Stats for {chat_title}\n\n"
+        f"👥 Telegram member total: {total}\n"
+        f"✅ Verified database records: {stats['verified']}\n"
+        f"⏳ Pending database records: {stats['pending']}\n"
+        f"❔ Unclassified estimate: {unknown}\n"
+        f"🛡 Current admins: {admins}\n"
+        f"⚠️ Verified/pending overlap: {stats['overlap']}\n\n"
+        f"🔗 Personal invite links: {links}\n"
+        f"🔨 Persistent bans: {bans}\n"
+        f"🚨 Link reviews awaiting admin: {reviews}\n\n"
+        "Read-only view: no database records were changed.\n"
+        "Database counts may include former members; Telegram total is live."
+    )
 
 
 def build_audit_member(member, verified_ids, pending_ids):
@@ -2471,23 +2492,29 @@ async def refreshstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await user_is_admin(update, context):
         return
 
-    chat_key = str(update.effective_chat.id)
-    running_scans = context.application.bot_data.setdefault(
-        "running_stats_scans",
-        set(),
+    chat = update.effective_chat
+    db = load_db()
+    stats = await get_readonly_stats(context.bot, db, chat.id)
+    links_here = sum(
+        1
+        for info in db.get("links", {}).values()
+        if str(info.get("chat_id")) == str(chat.id)
+    )
+    bans_here = len(db.get("bans", {}).get(str(chat.id), {}))
+    reviews_here = sum(
+        1
+        for info in db.get("link_review", {}).values()
+        if int(info.get("chat_id", 0)) == chat.id
     )
 
-    if chat_key in running_scans:
-        await update.message.reply_text(
-            "A stats refresh is already running for this server."
+    await update.message.reply_text(
+        format_readonly_stats(
+            chat.title,
+            stats,
+            links_here,
+            bans_here,
+            reviews_here,
         )
-        return
-
-    running_scans.add(chat_key)
-    context.application.create_task(
-        refreshstats_worker(update, context, chat_key),
-        update=update,
-        name=f"refreshstats:{chat_key}",
     )
 
 
@@ -2496,6 +2523,9 @@ async def refreshstats_worker(
     context: ContextTypes.DEFAULT_TYPE,
     chat_key: str,
 ):
+    # Legacy reconciliation is intentionally disabled. Stats are read-only.
+    return
+
     chat = update.effective_chat
     progress = await update.message.reply_text(
         "🔄 Refreshing server stats from Telegram..."
@@ -2683,7 +2713,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bans = db.get("bans", {}).get(str(chat.id), {})
     links = db.get("links", {})
     link_review = db.get("link_review", {})
-    stats = get_audit_stats(db, chat.id)
+    stats = await get_readonly_stats(context.bot, db, chat.id)
 
     links_here = [
         info for info in links.values()
@@ -2695,29 +2725,13 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if int(info.get("chat_id", 0)) == chat.id
     ]
 
-    if not stats["scanned_at"]:
-        text = (
-            f"📊 Stats for {chat.title}\n\n"
-            "No current member snapshot exists yet.\n"
-            "Run /refreshstats in the server, then use /stats again."
-        )
-    else:
-        text = (
-            f"📊 Stats for {chat.title}\n\n"
-            f"👥 Telegram member total: {stats['telegram_total'] if stats['telegram_total'] is not None else 'unavailable'}\n"
-            f"🗂 Active tracked members: {stats['active']}\n"
-            f"✅ Verified: {stats['verified']}\n"
-            f"⏳ Pending verification: {stats['pending']}\n"
-            f"❔ Unknown / not recorded: {stats['unknown']}\n"
-            f"🛡 Admins: {stats['admins']}\n"
-            f"🤖 Bots: {stats['bots']}\n"
-            f"🚪 Left or banned in last scan: {stats['departed']}\n"
-            f"⚠️ Lookup errors: {stats['errors']}\n\n"
-            f"🔗 Personal invite links: {len(links_here)}\n"
-            f"🔨 Persistent bans: {len(bans)}\n"
-            f"🚨 Link reviews awaiting admin: {len(review_here)}\n\n"
-            f"Last refreshed: {format_scan_time(stats['scanned_at'])}"
-        )
+    text = format_readonly_stats(
+        chat.title,
+        stats,
+        len(links_here),
+        len(bans),
+        len(review_here),
+    )
 
     try:
         await update.effective_user.send_message(text)
