@@ -1244,9 +1244,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_invites":
         db = load_db()
-        public_invites = db.get("public_invites",
-        "link_guard_settings",
-        "group_start_hits", {})
+        public_invites = db.get("public_invites", {})
 
         available = []
 
@@ -1300,9 +1298,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sid = data.split(":", 1)[1]
 
         db = load_db()
-        info = db.get("public_invites",
-        "link_guard_settings",
-        "group_start_hits", {}).get(str(sid))
+        info = db.get("public_invites", {}).get(str(sid))
 
         if not info or not info.get("enabled") or not info.get("invite_link"):
             await query.edit_message_text("That invite link is not available right now.")
@@ -1514,10 +1510,22 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             add_pending_verify(chat_id, chat_title, update.effective_user)
-
-    # Safety net: if user is restricted in the main group but has no pending record, create one.
-    if not get_pending_verify(update.effective_user.id):
-        await auto_approve_main_group(update, context)
+            rules = get_rules(chat_id)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ I agree to the rules",
+                        callback_data=f"agree:{chat_id}:{update.effective_user.id}",
+                    )
+                ]
+            ])
+            await update.message.reply_text(
+                f"✅ Verify Access for {chat_title}\n\n"
+                "Please read and acknowledge the rules below.\n\n"
+                f"{rules}",
+                reply_markup=keyboard,
+            )
+            return
 
     # Only show the full menu when explicitly requested
     if context.args and context.args[0].lower() in ["verify", "menu"]:
@@ -1525,9 +1533,89 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "DM received.\n\n"
-        "To verify, send:\n/start verify"
+        "I do not know which server you want to verify for.\n\n"
+        "Return to that server, type /verify, then use the verification button "
+        "created for you."
     )
+
+
+async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    if update.effective_chat.type not in ["group", "supergroup"]:
+        await update.message.reply_text(
+            "Use /verify inside the server you want to verify for."
+        )
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        status = str(member.status).lower()
+    except Exception:
+        status = ""
+
+    if status not in ["member", "administrator", "creator", "restricted"]:
+        return
+
+    if is_verified(user.id, chat.id) and status != "restricted":
+        notice = await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=update.message.message_thread_id,
+            text=(
+                f"{user.mention_html()} you have already verified for "
+                f"{chat.title}."
+            ),
+            parse_mode="HTML",
+        )
+        context.application.create_task(
+            delete_message_later(notice, 20),
+            update=update,
+            name=f"delete-verify-notice:{chat.id}:{notice.message_id}",
+        )
+        return
+
+    add_pending_verify(chat.id, chat.title, user)
+    remember_user(
+        user,
+        "verify_command",
+        chat_id=chat.id,
+        chat_title=chat.title,
+    )
+
+    bot_info = await context.bot.get_me()
+    payload = make_start_payload(chat.id, user.id)
+    url = f"https://t.me/{bot_info.username}?start={payload}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔓 Continue Verification", url=url)]
+    ])
+
+    await context.bot.send_message(
+        chat_id=chat.id,
+        message_thread_id=update.message.message_thread_id,
+        text=(
+            f"🔒 {user.mention_html()}, continue verification in a private "
+            "message with the bot."
+        ),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def delete_message_later(message, delay):
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except Exception:
+        pass
 
 
 async def verificationbutton_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1675,8 +1763,7 @@ async def early_link_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db["message_counts"][key] = count
     save_db(db)
 
-    settings = db.get("link_guard_settings",
-        "group_start_hits", {}).get(str(chat.id), {})
+    settings = db.get("link_guard_settings", {}).get(str(chat.id), {})
     enabled = settings.get("enabled", True)
     max_messages = int(settings.get("max_messages", 2))
 
@@ -3457,6 +3544,7 @@ def main():
     app.add_handler(CommandHandler("refreshstats", refreshstats_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("pending", pending_cmd))
+    app.add_handler(CommandHandler("verify", verify_cmd))
     app.add_handler(CommandHandler("verificationbutton", verificationbutton_cmd))
     app.add_handler(CommandHandler("setreminder", setreminder_cmd))
     app.add_handler(CommandHandler("setreminderchannel", setreminderchannel_cmd))
