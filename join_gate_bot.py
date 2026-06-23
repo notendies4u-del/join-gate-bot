@@ -1534,8 +1534,8 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "I do not know which server you want to verify for.\n\n"
-        "Return to that server, type /verify, then use the verification button "
-        "created for you."
+        "Return to that server, type /verify, or use the verification button "
+        "created for you in the server."
     )
 
 
